@@ -1,3 +1,4 @@
+
 name: Build CP77 Discord RPC 2
 
 on:
@@ -25,21 +26,18 @@ jobs:
           $sdk = "src/red4ext/libs/RED4ext.SDK"
 
           git submodule update --init --recursive
-
           if ($LASTEXITCODE -ne 0) {
             throw "Failed to initialize submodules."
           }
 
-          git -C $sdk fetch origin HEAD
-
+          git -C $sdk fetch origin
           if ($LASTEXITCODE -ne 0) {
-            throw "Failed to fetch the latest RED4ext SDK."
+            throw "Failed to fetch RED4ext SDK."
           }
 
           git -C $sdk checkout --detach FETCH_HEAD
-
           if ($LASTEXITCODE -ne 0) {
-            throw "Failed to check out the latest RED4ext SDK."
+            throw "Failed to check out RED4ext SDK."
           }
 
           git -C $sdk log -1 --oneline
@@ -78,8 +76,6 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $extract -Force
 
-          # The official SDK has c/discord_game_sdk.h and
-          # lib/x86_64/discord_game_sdk.dll plus its import library.
           $candidates = @($extract) +
             @(Get-ChildItem $extract -Directory -Recurse |
               Select-Object -ExpandProperty FullName)
@@ -98,14 +94,12 @@ jobs:
           }
 
           if (!$sdkRoot) {
-            Write-Host "Extracted SDK files:"
             Get-ChildItem $extract -File -Recurse |
               Select-Object -ExpandProperty FullName
             throw "Could not locate the expected Discord Game SDK files."
           }
 
           $destination = "src/red4ext/libs/discord_game_sdk"
-
           New-Item -ItemType Directory -Path $destination -Force |
             Out-Null
 
@@ -130,7 +124,6 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           & $env:PREMAKE_EXE configure
-
           if ($LASTEXITCODE -ne 0) {
             throw "Premake configure failed."
           }
@@ -140,8 +133,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          & $env:PREMAKE_EXE vs2022
-
+          & $env:PREMAKE_EXE --arch=x86_64 vs2022
           if ($LASTEXITCODE -ne 0) {
             throw "Premake Visual Studio generation failed."
           }
@@ -155,14 +147,37 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          msbuild cp77rpc2.sln `
-            /m `
-            /p:Configuration=Release `
-            /p:Platform=x64 `
-            /verbosity:minimal
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          if (!(Test-Path $vswhere)) {
+            throw "vswhere.exe was not found."
+          }
+
+          $vsPath = & $vswhere `
+            -latest `
+            -products '*' `
+            -requires Microsoft.Component.MSBuild `
+            -property installationPath
+
+          if (!$vsPath) {
+            throw "Visual Studio with MSBuild was not found."
+          }
+
+          $msbuild = Join-Path $vsPath "MSBuild\Current\Bin\MSBuild.exe"
+
+          if (!(Test-Path $msbuild)) {
+            throw "MSBuild.exe was not found at $msbuild"
+          }
+
+          & $msbuild cp77rpc2.sln `
+            -m `
+            -t:cp77rpc2 `
+            -p:Configuration=Release `
+            -p:Platform=x64 `
+            -verbosity:minimal
 
           if ($LASTEXITCODE -ne 0) {
-            throw "MSBuild failed."
+            throw "MSBuild failed with exit code $LASTEXITCODE"
           }
 
       - name: Package plugin
