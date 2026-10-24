@@ -1,3 +1,4 @@
+
 name: CP77-DiscordRPC2 Build 2.5.1
 
 on:
@@ -15,91 +16,101 @@ jobs:
     runs-on: windows-2022
 
     steps:
-      - name: Checkout CP77-DiscordRPC2
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
-          repository: SynergyShadow/CP77-DiscordRPC2
-          ref: master
           submodules: recursive
           fetch-depth: 0
 
-      - name: Set up Premake5
+      - name: Download Premake5
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $zip = "$env:RUNNER_TEMP/premake.zip"
+          $dir = "$env:RUNNER_TEMP/premake"
 
-          $url = "https://github.com/premake/premake-core/releases/download/v5.0.0-beta2/premake-5.0.0-beta2-windows.zip"
-          $zip = Join-Path $env:RUNNER_TEMP "premake.zip"
-          $dir = Join-Path $env:RUNNER_TEMP "premake"
+          Invoke-WebRequest `
+            "https://github.com/premake/premake-core/releases/download/v5.0.0-beta2/premake-5.0.0-beta2-windows.zip" `
+            -OutFile $zip
 
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          Expand-Archive $zip $dir -Force
 
-          $exe = Get-ChildItem -Path $dir -Filter "premake5.exe" -Recurse -File |
+          $exe = Get-ChildItem $dir -Filter premake5.exe -Recurse |
             Select-Object -First 1
 
           if (-not $exe) {
-            throw "premake5.exe was not found in the downloaded archive."
+            throw "Premake5 executable not found."
           }
 
           "PREMAKE_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
-          Write-Host "Premake executable: $($exe.FullName)"
 
-      - name: Locate Premake script
-        id: premake
+      - name: Locate project
+        id: project
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $script = Get-ChildItem -Path . -Filter "premake5.lua" -Recurse -File |
-            Where-Object { $_.FullName -notmatch '[\\/](vendor|\.git)[\\/]' } |
+          $script = Get-ChildItem . -Filter premake5.lua -Recurse |
+            Where-Object {
+              $_.FullName -notmatch '[\\/](.git|vendor)[\\/]'
+            } |
             Select-Object -First 1
 
           if (-not $script) {
-            throw "premake5.lua was not found in this repository."
+            throw "premake5.lua not found."
           }
 
-          $dir = $script.Directory.FullName
-          "dir=$dir" >> $env:GITHUB_OUTPUT
-          Write-Host "Premake script directory: $dir"
+          "dir=$($script.Directory.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Install Discord SDK
+        shell: pwsh
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Check whether the repository already provides the SDK.
+          $sdk = Get-ChildItem . -Directory -Recurse |
+            Where-Object {
+              $_.Name -eq "discord_game_sdk"
+            } |
+            Select-Object -First 1
+
+          if (-not $sdk) {
+            throw "The Discord SDK directory is missing. Check the repository's documented SDK path and dependency instructions."
+          }
+
+          Write-Host "Found SDK directory: $($sdk.FullName)"
 
       - name: Generate Visual Studio project
         shell: pwsh
-        working-directory: ${{ steps.premake.outputs.dir }}
+        working-directory: ${{ steps.project.outputs.dir }}
         run: |
-          $ErrorActionPreference = "Stop"
-
           & $env:PREMAKE_EXE vs2022
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Premake project generation failed with exit code $LASTEXITCODE."
+            throw "Premake generation failed."
           }
-
-      - name: Locate solution
-        id: solution
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $solution = Get-ChildItem -Path . -Filter "*.sln" -Recurse -File |
-            Where-Object { $_.FullName -notmatch '[\\/](vendor|\.git)[\\/]' } |
-            Select-Object -First 1
-
-          if (-not $solution) {
-            throw "No Visual Studio solution was generated."
-          }
-
-          "path=$($solution.FullName)" >> $env:GITHUB_OUTPUT
-          Write-Host "Solution: $($solution.FullName)"
 
       - name: Set up MSBuild
         uses: microsoft/setup-msbuild@v2
 
+      - name: Find solution
+        id: solution
+        shell: pwsh
+        run: |
+          $sln = Get-ChildItem . -Filter *.sln -Recurse |
+            Where-Object {
+              $_.FullName -notmatch '[\\/](.git|vendor)[\\/]'
+            } |
+            Select-Object -First 1
+
+          if (-not $sln) {
+            throw "No Visual Studio solution was generated."
+          }
+
+          "path=$($sln.FullName)" >> $env:GITHUB_OUTPUT
+
       - name: Build Release
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
           msbuild "${{ steps.solution.outputs.path }}" `
             /m `
             /t:Build `
@@ -108,45 +119,15 @@ jobs:
             /verbosity:minimal
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Build failed with exit code $LASTEXITCODE."
+            throw "Compilation failed."
           }
 
-      - name: Collect build outputs
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $out = Join-Path $PWD "artifact"
-          New-Item -ItemType Directory -Path $out -Force | Out-Null
-
-          $dlls = Get-ChildItem -Path . -Filter "*.dll" -Recurse -File |
-            Where-Object {
-              $_.FullName -notmatch '[\\/](vendor|\.git|artifact)[\\/]' -and
-              $_.FullName -match '[\\/](bin|build|release|x64)[\\/]'
-            }
-
-          if (-not $dlls) {
-            $dlls = Get-ChildItem -Path . -Filter "*.dll" -Recurse -File |
-              Where-Object {
-                $_.FullName -notmatch '[\\/](vendor|\.git|artifact)[\\/]'
-              }
-          }
-
-          if (-not $dlls) {
-            throw "No compiled DLLs were found."
-          }
-
-          $dlls | ForEach-Object {
-            Write-Host "Found: $($_.FullName)"
-            Copy-Item $_.FullName $out -Force
-          }
-
-          Get-ChildItem $out -File | Get-FileHash -Algorithm SHA256 | Format-Table -AutoSize
-
-      - name: Upload build artifacts
+      - name: Upload build outputs
         uses: actions/upload-artifact@v4
         with:
-          name: CP77-DiscordRPC2-2.5.1
-          path: artifact/*
+          name: CP77-DiscordRPC2-build
+          path: |
+            **/cp77rpc2.dll
+            **/discord_game_sdk.dll
           if-no-files-found: error
           retention-days: 14
