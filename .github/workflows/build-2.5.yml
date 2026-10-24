@@ -1,11 +1,10 @@
-name: CP77-DiscordRPC2 Build 2.5.1
+name: Build CP77 Discord RPC 2
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - master
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,180 +14,135 @@ jobs:
     runs-on: windows-2022
 
     steps:
-      - name: Checkout source
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          repository: SynergyShadow/CP77-DiscordRPC2
-          ref: master
           submodules: recursive
           fetch-depth: 0
 
-      - name: Download Discord Game SDK
+      - name: Update RED4ext SDK
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          $sdk = "src/red4ext/libs/RED4ext.SDK"
 
-          $url = "https://dl-game-sdk.discordapp.net/2.5.6/discord_game_sdk.zip"
-          $zip = Join-Path $env:RUNNER_TEMP "discord_game_sdk.zip"
-          $extract = Join-Path $env:RUNNER_TEMP "discord_game_sdk_extract"
-          $target = Join-Path $PWD "src/red4ext/libs/discord_game_sdk"
-
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          if (-not (Test-Path $zip)) {
-            throw "Discord SDK download failed."
+          if (!(Test-Path "$sdk/.git")) {
+            git submodule update --init --recursive
           }
 
+          git -C $sdk fetch origin
+          git -C $sdk checkout origin/master
+          git -C $sdk log -1 --oneline
+
+      - name: Install Premake
+        shell: pwsh
+        run: |
+          $url = "https://github.com/premake/premake-core/releases/download/v5.0.0-beta2/premake-5.0.0-beta2-windows.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP/premake.zip"
+
+          Expand-Archive `
+            -Path "$env:RUNNER_TEMP/premake.zip" `
+            -DestinationPath "$env:RUNNER_TEMP/premake" `
+            -Force
+
+          $premake = Get-ChildItem "$env:RUNNER_TEMP/premake" `
+            -Filter "premake5.exe" -Recurse |
+            Select-Object -First 1
+
+          if (!$premake) {
+            throw "premake5.exe was not found in the downloaded archive."
+          }
+
+          "PREMAKE_DIR=$($premake.DirectoryName)" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+          "PATH=$($premake.DirectoryName);$env:PATH" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install Discord Game SDK
+        shell: pwsh
+        run: |
+          $url = "https://dl-game-sdk.discordapp.net/2.5.6/discord_game_sdk.zip"
+          $zip = "$env:RUNNER_TEMP/discord_game_sdk.zip"
+          $extract = "$env:RUNNER_TEMP/discord_game_sdk"
+
+          Invoke-WebRequest -Uri $url -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $extract -Force
 
-          $header = Get-ChildItem $extract -Filter "discord_game_sdk.h" -Recurse -File |
+          $sdkRoot = Get-ChildItem $extract -Directory -Recurse |
+            Where-Object {
+              (Test-Path (Join-Path $_.FullName "lib/x86_64")) -and
+              (Test-Path (Join-Path $_.FullName "include/discord_game_sdk.h"))
+            } |
             Select-Object -First 1
 
-          $cppHeader = Get-ChildItem $extract -Filter "discord.h" -Recurse -File |
-            Where-Object { $_.FullName -match '[\\/]cpp[\\/]' } |
-            Select-Object -First 1
-
-          $runtime = Get-ChildItem $extract -Filter "discord_game_sdk.dll" -Recurse -File |
-            Where-Object { $_.FullName -match '[\\/]x86_64[\\/]' } |
-            Select-Object -First 1
-
-          $library = Get-ChildItem $extract -Filter "discord_game_sdk.dll.lib" -Recurse -File |
-            Select-Object -First 1
-
-          if (-not $header -or -not $runtime) {
-            throw "Downloaded archive is missing expected Discord SDK files."
+          if (!$sdkRoot) {
+            throw "Could not find the expected Discord Game SDK directory layout."
           }
 
-          New-Item -ItemType Directory -Path $target -Force | Out-Null
+          $destination = "src/red4ext/libs/discord_game_sdk"
 
-          # Preserve the downloaded SDK's directory structure.
-          $sdkRoot = $header.Directory.Parent.FullName
-          Copy-Item (Join-Path $extract "*") $target -Recurse -Force
+          New-Item -ItemType Directory -Path $destination -Force |
+            Out-Null
 
-          Write-Host "SDK header: $($header.FullName)"
-          Write-Host "SDK runtime: $($runtime.FullName)"
-          if ($cppHeader) {
-            Write-Host "C++ header: $($cppHeader.FullName)"
-          }
-          if ($library) {
-            Write-Host "Import library: $($library.FullName)"
+          Copy-Item "$($sdkRoot.FullName)/*" $destination -Recurse -Force
+
+          if (!(Test-Path "$destination/lib/x86_64/discord_game_sdk.dll")) {
+            throw "Discord Game SDK DLL was not found after extraction."
           }
 
-          Get-ChildItem $target -Recurse -File |
-            Select-Object -First 30 -ExpandProperty FullName
-
-      - name: Install Premake5
+      - name: Generate Visual Studio project
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $zip = Join-Path $env:RUNNER_TEMP "premake.zip"
-          $dir = Join-Path $env:RUNNER_TEMP "premake"
-
-          $url = "https://github.com/premake/premake-core/releases/download/v5.0.0-beta2/premake-5.0.0-beta2-windows.zip"
-
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath $dir -Force
-
-          $exe = Get-ChildItem $dir -Filter "premake5.exe" -Recurse -File |
-            Select-Object -First 1
-
-          if (-not $exe) {
-            throw "premake5.exe was not found."
-          }
-
-          "PREMAKE_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
-
-      - name: Verify project files
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if (-not (Test-Path "premake5.lua")) {
-            throw "Expected premake5.lua in repository root."
-          }
-
-          if (-not (Test-Path "src/red4ext/libs/discord_game_sdk")) {
-            throw "Discord SDK directory was not created."
-          }
-
-      - name: Configure Premake
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          & $env:PREMAKE_EXE configure
+          premake5 configure
           if ($LASTEXITCODE -ne 0) {
-            throw "Premake configure failed: $LASTEXITCODE"
+            throw "Premake configure failed."
           }
 
-      - name: Generate Visual Studio solution
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          & $env:PREMAKE_EXE vs2022
+          premake5 vs2022
           if ($LASTEXITCODE -ne 0) {
-            throw "Premake VS2022 generation failed: $LASTEXITCODE"
+            throw "Premake VS2022 generation failed."
           }
 
-      - name: Set up MSBuild
-        uses: microsoft/setup-msbuild@v2
-
-      - name: Build Release
+      - name: Build plugin
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          if (-not (Test-Path "cp77rpc2.sln")) {
-            throw "cp77rpc2.sln was not generated in the repository root."
+          if (!(Test-Path "cp77rpc2.sln")) {
+            throw "cp77rpc2.sln was not generated."
           }
 
-          msbuild "cp77rpc2.sln" `
+          msbuild cp77rpc2.sln `
             /m `
-            /t:Build `
             /p:Configuration=Release `
             /p:Platform=x64 `
             /verbosity:minimal
 
           if ($LASTEXITCODE -ne 0) {
-            throw "MSBuild failed: $LASTEXITCODE"
+            throw "Plugin build failed."
           }
 
-      - name: Package plugin
+      - name: Prepare plugin files
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $plugin = Get-ChildItem "src/red4ext/build" `
-            -Filter "cp77rpc2.dll" -Recurse -File |
+          $buildDir = "src/red4ext/build/Configuration"
+          $dll = Get-ChildItem $buildDir -Filter "cp77rpc2.dll" -Recurse |
             Select-Object -First 1
 
-          if (-not $plugin) {
-            throw "Compiled cp77rpc2.dll was not found."
+          if (!$dll) {
+            throw "cp77rpc2.dll was not produced by the build."
           }
 
-          $sdk = Get-ChildItem "src/red4ext/libs/discord_game_sdk" `
-            -Filter "discord_game_sdk.dll" -Recurse -File |
-            Select-Object -First 1
+          $output = "artifacts"
+          New-Item -ItemType Directory -Path $output -Force |
+            Out-Null
 
-          if (-not $sdk) {
-            throw "Discord Game SDK runtime DLL was not found."
-          }
-
-          $out = Join-Path $PWD "artifact"
-          New-Item -ItemType Directory -Path $out -Force | Out-Null
-
-          Copy-Item $plugin.FullName $out -Force
-          Copy-Item $sdk.FullName $out -Force
-
-          Get-ChildItem $out -File |
-            Get-FileHash -Algorithm SHA256 |
-            Format-Table -AutoSize
+          Copy-Item $dll.FullName "$output/cp77rpc2.dll" -Force
+          Copy-Item `
+            "src/red4ext/libs/discord_game_sdk/lib/x86_64/discord_game_sdk.dll" `
+            "$output/discord_game_sdk.dll" -Force
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: CP77-DiscordRPC2-2.5.1
-          path: artifact/*
+          name: CP77-DiscordRPC2
+          path: artifacts/
           if-no-files-found: error
-          retention-days: 14
