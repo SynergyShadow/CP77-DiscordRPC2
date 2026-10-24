@@ -1,8 +1,12 @@
-name: build-2.5
+
+name: CP77-DiscordRPC2 Build 2.5.1
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - master
+      - main
 
 permissions:
   contents: read
@@ -10,147 +14,137 @@ permissions:
 jobs:
   build:
     runs-on: windows-2022
-    env:
-      PROJECT: Codeware
 
     steps:
-      - name: Checkout Codeware
+      - name: Checkout CP77-DiscordRPC2
         uses: actions/checkout@v4
         with:
+          repository: SynergyShadow/CP77-DiscordRPC2
+          ref: master
           submodules: recursive
           fetch-depth: 0
 
-      - name: Configure RED4ext SDK
+      - name: Set up Premake5
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          git config -f .gitmodules submodule.vendor/RED4ext.SDK.url "https://github.com/KelpHect/RED4ext.SDK-psiberx.git"
-          if ($LASTEXITCODE -ne 0) { throw "Failed to configure SDK URL." }
+          choco install premake --yes --no-progress
 
-          git submodule sync -- vendor/RED4ext.SDK
-          if ($LASTEXITCODE -ne 0) { throw "Failed to synchronize SDK submodule." }
-
-          git submodule update --init --force vendor/RED4ext.SDK
-          if ($LASTEXITCODE -ne 0) { throw "Failed to update SDK submodule." }
-
-          $sdk = (git -C vendor/RED4ext.SDK rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0) { throw "Failed to read SDK commit." }
-
-          Write-Host "RED4ext SDK commit: $sdk"
-
-          if ($sdk -ne "12e0c33337f8612850854fb9ed5ad9628796afca") {
-            throw "Unexpected SDK commit: $sdk"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install Premake5."
           }
 
-      - name: Set up Xmake
-        uses: xmake-io/github-action-setup-xmake@v1
-        with:
-          xmake-version: latest
-
-      - name: Pin mimalloc 2.2.4
+      - name: Verify build tools
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $path = "xmake.lua"
 
-          if (-not (Test-Path $path)) {
-            throw "xmake.lua was not found."
-          }
-
-          $content = Get-Content $path -Raw
-          $pin = 'add_requireconfs("tiltedcore.mimalloc", {version = "2.2.4", override = true})'
-          $pattern = 'add_requireconfs\s*\(\s*["'']tiltedcore\.mimalloc'
-
-          if ($content -match $pattern) {
-            Write-Host "Mimalloc override already exists."
-          } else {
-            $anchor = 'add_requires("hopscotch-map", "minhook", "spdlog", "tiltedcore")'
-
-            if (-not $content.Contains($anchor)) {
-              throw "Expected add_requires declaration was not found."
+          if (-not (Get-Command premake5 -ErrorAction SilentlyContinue)) {
+            if (-not (Get-Command premake -ErrorAction SilentlyContinue)) {
+              throw "Premake executable was not found."
             }
-
-            $content = $content.Replace($anchor, "$pin`r`n$anchor")
-            Set-Content -Path $path -Value $content -NoNewline
           }
 
-      - name: Configure Release
-        shell: pwsh
-        run: |
-          xmake f -m release -y
-          if ($LASTEXITCODE -ne 0) {
-            throw "Xmake configuration failed: exit code $LASTEXITCODE"
+          if (-not (Test-Path "premake5.lua")) {
+            throw "premake5.lua was not found."
           }
 
-      - name: Build Codeware
-        shell: pwsh
-        run: |
-          xmake -y
-          if ($LASTEXITCODE -ne 0) {
-            throw "Codeware build failed: exit code $LASTEXITCODE"
-          }
-
-      - name: Locate DLL
-        id: locate
+      - name: Configure project
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $dll = Get-ChildItem -Path build -Recurse -File -Filter "Codeware.dll" -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '[\\/]release[\\/]' } |
+          premake5 configure
+          if ($LASTEXITCODE -ne 0) {
+            throw "Premake configure failed."
+          }
+
+          premake5 vs2022
+          if ($LASTEXITCODE -ne 0) {
+            throw "Visual Studio project generation failed."
+          }
+
+      - name: Locate solution
+        id: solution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $solution = Get-ChildItem -Path . -Filter "cp77rpc2.sln" -Recurse -File |
+            Where-Object { $_.FullName -notmatch '[\\/](vendor|\.git)[\\/]' } |
+            Select-Object -First 1
+
+          if (-not $solution) {
+            throw "cp77rpc2.sln was not generated."
+          }
+
+          "path=$($solution.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Build Release
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Compile CP77-DiscordRPC2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          msbuild "${{ steps.solution.outputs.path }}" `
+            /m `
+            /t:Build `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:RestorePackagesConfig=true `
+            /verbosity:minimal
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CP77-DiscordRPC2 compilation failed."
+          }
+
+      - name: Collect compiled files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dll = Get-ChildItem -Path "src/red4ext" `
+            -Filter "cp77rpc2.dll" -Recurse -File |
             Select-Object -First 1
 
           if (-not $dll) {
-            $dll = Get-ChildItem -Path . -Recurse -File -Filter "Codeware.dll" |
-              Where-Object { $_.FullName -notmatch '[\\/](vendor|\.git)[\\/]' } |
+            $dll = Get-ChildItem -Path . `
+              -Filter "cp77rpc2.dll" -Recurse -File |
+              Where-Object {
+                $_.FullName -notmatch '[\\/](vendor|\.git)[\\/]'
+              } |
               Select-Object -First 1
           }
 
           if (-not $dll) {
-            throw "Codeware.dll was not produced."
+            throw "cp77rpc2.dll was not produced."
           }
 
-          Write-Host "DLL: $($dll.FullName)"
-          "dll=$($dll.FullName)" >> $env:GITHUB_OUTPUT
-
-      - name: Package release ZIP
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $script = Join-Path $PWD "tools/dist/package-mod.ps1"
-          $dll = "${{ steps.locate.outputs.dll }}"
-
-          if (-not (Test-Path $script)) {
-            throw "Packaging script not found: $script"
-          }
-
-          if (-not (Test-Path $dll)) {
-            throw "Compiled DLL not found: $dll"
-          }
-
-          New-Item -ItemType Directory -Path "build/dist" -Force | Out-Null
-
-          & $script -ReleaseBin $dll -ProjectName $env:PROJECT
-
-          if (-not $?) {
-            throw "Packaging script failed."
-          }
-
-          $zip = Get-ChildItem -Path "build/dist" -File -Filter "*.zip" -ErrorAction SilentlyContinue |
+          $sdk = Get-ChildItem -Path "src/red4ext/libs" `
+            -Filter "discord_game_sdk.dll" -Recurse -File |
             Select-Object -First 1
 
-          if (-not $zip) {
-            throw "No ZIP was produced in build/dist."
+          if (-not $sdk) {
+            throw "discord_game_sdk.dll was not found."
           }
 
-          Get-FileHash $dll -Algorithm SHA256 | Format-List
-          Get-FileHash $zip.FullName -Algorithm SHA256 | Format-List
+          $out = Join-Path $PWD "artifact"
+          New-Item -ItemType Directory -Path $out -Force |
+            Out-Null
 
-      - name: Upload release artifact
+          Copy-Item $dll.FullName (Join-Path $out "cp77rpc2.dll")
+          Copy-Item $sdk.FullName (Join-Path $out "discord_game_sdk.dll")
+
+          Get-FileHash (Join-Path $out "cp77rpc2.dll") -Algorithm SHA256
+          Get-FileHash (Join-Path $out "discord_game_sdk.dll") -Algorithm SHA256
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Codeware-${{ github.sha }}
-          path: build/dist/*.zip
+          name: CP77-DiscordRPC2-2.5.1
+          path: artifact/*.dll
           if-no-files-found: error
           retention-days: 14
