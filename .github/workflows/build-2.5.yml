@@ -2,8 +2,6 @@ name: Build CP77 Discord RPC 2
 
 on:
   push:
-    branches:
-      - master
   workflow_dispatch:
 
 permissions:
@@ -23,44 +21,56 @@ jobs:
       - name: Update RED4ext SDK
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $sdk = "src/red4ext/libs/RED4ext.SDK"
 
-          if (!(Test-Path "$sdk/.git")) {
-            git submodule update --init --recursive
+          git submodule update --init --recursive
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to initialize submodules."
           }
 
-          git -C $sdk fetch origin
-          git -C $sdk checkout origin/master
+          git -C $sdk fetch origin HEAD
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to fetch the latest RED4ext SDK."
+          }
+
+          git -C $sdk checkout --detach FETCH_HEAD
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to check out the latest RED4ext SDK."
+          }
+
           git -C $sdk log -1 --oneline
 
       - name: Install Premake
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $url = "https://github.com/premake/premake-core/releases/download/v5.0.0-beta2/premake-5.0.0-beta2-windows.zip"
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP/premake.zip"
+          $zip = "$env:RUNNER_TEMP/premake.zip"
+          $extract = "$env:RUNNER_TEMP/premake"
 
-          Expand-Archive `
-            -Path "$env:RUNNER_TEMP/premake.zip" `
-            -DestinationPath "$env:RUNNER_TEMP/premake" `
-            -Force
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
 
-          $premake = Get-ChildItem "$env:RUNNER_TEMP/premake" `
-            -Filter "premake5.exe" -Recurse |
+          $exe = Get-ChildItem $extract -Filter "premake5.exe" -File -Recurse |
             Select-Object -First 1
 
-          if (!$premake) {
-            throw "premake5.exe was not found in the downloaded archive."
+          if (!$exe) {
+            throw "premake5.exe was not found."
           }
 
-          "PREMAKE_DIR=$($premake.DirectoryName)" |
-            Out-File -FilePath $env:GITHUB_ENV -Append
-
-          "PATH=$($premake.DirectoryName);$env:PATH" |
+          "PREMAKE_EXE=$($exe.FullName)" |
             Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Discord Game SDK
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $url = "https://dl-game-sdk.discordapp.net/2.5.6/discord_game_sdk.zip"
           $zip = "$env:RUNNER_TEMP/discord_game_sdk.zip"
           $extract = "$env:RUNNER_TEMP/discord_game_sdk"
@@ -68,15 +78,30 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $extract -Force
 
-          $sdkRoot = Get-ChildItem $extract -Directory -Recurse |
-            Where-Object {
-              (Test-Path (Join-Path $_.FullName "lib/x86_64")) -and
-              (Test-Path (Join-Path $_.FullName "include/discord_game_sdk.h"))
-            } |
-            Select-Object -First 1
+          # The official SDK has c/discord_game_sdk.h and
+          # lib/x86_64/discord_game_sdk.dll plus its import library.
+          $candidates = @($extract) +
+            @(Get-ChildItem $extract -Directory -Recurse |
+              Select-Object -ExpandProperty FullName)
+
+          $sdkRoot = $null
+
+          foreach ($candidate in $candidates) {
+            if (
+              (Test-Path (Join-Path $candidate "c/discord_game_sdk.h")) -and
+              (Test-Path (Join-Path $candidate "lib/x86_64/discord_game_sdk.dll")) -and
+              (Test-Path (Join-Path $candidate "lib/x86_64/discord_game_sdk.dll.lib"))
+            ) {
+              $sdkRoot = $candidate
+              break
+            }
+          }
 
           if (!$sdkRoot) {
-            throw "Could not find the expected Discord Game SDK directory layout."
+            Write-Host "Extracted SDK files:"
+            Get-ChildItem $extract -File -Recurse |
+              Select-Object -ExpandProperty FullName
+            throw "Could not locate the expected Discord Game SDK files."
           }
 
           $destination = "src/red4ext/libs/discord_game_sdk"
@@ -84,31 +109,51 @@ jobs:
           New-Item -ItemType Directory -Path $destination -Force |
             Out-Null
 
-          Copy-Item "$($sdkRoot.FullName)/*" $destination -Recurse -Force
+          Get-ChildItem $destination -Force |
+            Remove-Item -Recurse -Force
 
-          if (!(Test-Path "$destination/lib/x86_64/discord_game_sdk.dll")) {
-            throw "Discord Game SDK DLL was not found after extraction."
+          Copy-Item "$sdkRoot/*" $destination -Recurse -Force
+
+          if (
+            !(Test-Path "$destination/c/discord_game_sdk.h") -or
+            !(Test-Path "$destination/lib/x86_64/discord_game_sdk.dll") -or
+            !(Test-Path "$destination/lib/x86_64/discord_game_sdk.dll.lib")
+          ) {
+            throw "Discord Game SDK files were not copied correctly."
           }
 
-      - name: Generate Visual Studio project
+          Write-Host "Discord Game SDK installed successfully."
+
+      - name: Configure dependencies
         shell: pwsh
         run: |
-          premake5 configure
+          $ErrorActionPreference = "Stop"
+
+          & $env:PREMAKE_EXE configure
+
           if ($LASTEXITCODE -ne 0) {
             throw "Premake configure failed."
           }
 
-          premake5 vs2022
+      - name: Generate Visual Studio solution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & $env:PREMAKE_EXE vs2022
+
           if ($LASTEXITCODE -ne 0) {
-            throw "Premake VS2022 generation failed."
+            throw "Premake Visual Studio generation failed."
+          }
+
+          if (!(Test-Path "cp77rpc2.sln")) {
+            throw "cp77rpc2.sln was not generated in the repository root."
           }
 
       - name: Build plugin
         shell: pwsh
         run: |
-          if (!(Test-Path "cp77rpc2.sln")) {
-            throw "cp77rpc2.sln was not generated."
-          }
+          $ErrorActionPreference = "Stop"
 
           msbuild cp77rpc2.sln `
             /m `
@@ -117,28 +162,38 @@ jobs:
             /verbosity:minimal
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Plugin build failed."
+            throw "MSBuild failed."
           }
 
-      - name: Prepare plugin files
+      - name: Package plugin
         shell: pwsh
         run: |
-          $buildDir = "src/red4ext/build/Configuration"
-          $dll = Get-ChildItem $buildDir -Filter "cp77rpc2.dll" -Recurse |
-            Select-Object -First 1
+          $ErrorActionPreference = "Stop"
 
-          if (!$dll) {
-            throw "cp77rpc2.dll was not produced by the build."
+          $dll = "src/red4ext/build/Configuration/cp77rpc2.dll"
+          $discordDll = "src/red4ext/libs/discord_game_sdk/lib/x86_64/discord_game_sdk.dll"
+
+          if (!(Test-Path $dll)) {
+            Write-Host "Searching for built plugin..."
+            Get-ChildItem src/red4ext -Filter "cp77rpc2.dll" -File -Recurse |
+              Select-Object -ExpandProperty FullName
+            throw "cp77rpc2.dll was not found."
+          }
+
+          if (!(Test-Path $discordDll)) {
+            throw "discord_game_sdk.dll was not found."
           }
 
           $output = "artifacts"
           New-Item -ItemType Directory -Path $output -Force |
             Out-Null
 
-          Copy-Item $dll.FullName "$output/cp77rpc2.dll" -Force
-          Copy-Item `
-            "src/red4ext/libs/discord_game_sdk/lib/x86_64/discord_game_sdk.dll" `
-            "$output/discord_game_sdk.dll" -Force
+          Copy-Item $dll "$output/cp77rpc2.dll" -Force
+          Copy-Item $discordDll "$output/discord_game_sdk.dll" -Force
+
+          Write-Host "Packaged files:"
+          Get-ChildItem $output -File |
+            Select-Object Name, Length
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
